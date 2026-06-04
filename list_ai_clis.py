@@ -148,6 +148,9 @@ def create_desktop_shortcut():
     script_path = os.path.abspath(__file__)
     python_exe = sys.executable
     
+    icon_path = os.path.join(os.path.expanduser('~'), 'darkmedia-x_ai_cli', 'icon.ico')
+    icon_location = f"{icon_path}, 0" if os.path.exists(icon_path) else "cmd.exe, 0"
+    
     ps_cmd = f"""
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut("{shortcut_path}")
@@ -155,7 +158,7 @@ def create_desktop_shortcut():
     $Shortcut.Arguments = '"{script_path}"'
     $Shortcut.WorkingDirectory = "{os.path.dirname(script_path)}"
     $Shortcut.Description = "Tableau de bord de mes CLI IA"
-    $Shortcut.IconLocation = "cmd.exe, 0"
+    $Shortcut.IconLocation = "{icon_location}"
     $Shortcut.Save()
     """
     try:
