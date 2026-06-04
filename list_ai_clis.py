@@ -148,7 +148,7 @@ def create_desktop_shortcut():
     script_path = os.path.abspath(__file__)
     python_exe = sys.executable
     
-    icon_path = os.path.join(os.path.expanduser('~'), 'darkmedia-x_ai_cli', 'icon.ico')
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico')
     icon_location = f"{icon_path}, 0" if os.path.exists(icon_path) else "cmd.exe, 0"
     
     ps_cmd = f"""
