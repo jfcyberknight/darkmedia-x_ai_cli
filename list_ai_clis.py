@@ -59,6 +59,9 @@ C_MAGENTA = "\033[35m"
 #   'model_flag'    : option pour imposer un modèle (None si le CLI ne le permet pas).
 #   'default_model' : modèle par défaut « le moins cher » (None = défaut natif du CLI).
 #                     Modifiable par l'utilisateur via le menu [M] (persisté dans un JSON).
+#   'models_by_tier': paliers {'mini': ..., 'strong': ...} parmi lesquels l'agent choisit
+#                     selon la complexité de la tâche (simple -> mini, complexe -> strong).
+#                     Ignoré si l'utilisateur a épinglé un modèle via [M]. None = pas d'auto.
 CLI_TOOLS = [
     {
         'key': 'agy',
@@ -72,6 +75,7 @@ CLI_TOOLS = [
         'auto_approve': ['--dangerously-skip-permissions'],
         'model_flag': '--model',
         'default_model': None,  # format du --model incertain -> laissé au défaut d'agy
+        'models_by_tier': None,  # agy sélectionne son modèle Gemini en interne
     },
     {
         'key': 'claude',
@@ -86,6 +90,7 @@ CLI_TOOLS = [
         'auto_approve': ['--dangerously-skip-permissions'],
         'model_flag': '--model',
         'default_model': 'haiku',  # le moins cher chez Anthropic
+        'models_by_tier': {'mini': 'haiku', 'strong': 'sonnet'},
     },
     {
         'key': 'opencode',
@@ -98,6 +103,8 @@ CLI_TOOLS = [
         'auto_approve': [],
         'model_flag': '-m',
         'default_model': 'opencode/deepseek-v4-flash-free',  # gratuit
+        'models_by_tier': {'mini': 'opencode/deepseek-v4-flash-free',
+                           'strong': 'opencode-go/qwen3.7-max'},
     },
     {
         'key': 'kilocode',
@@ -110,6 +117,8 @@ CLI_TOOLS = [
         'auto_approve': [],
         'model_flag': '-m',
         'default_model': 'kilo/amazon/nova-micro-v1',  # parmi les moins chers
+        'models_by_tier': {'mini': 'kilo/amazon/nova-micro-v1',
+                           'strong': 'kilo/~anthropic/claude-sonnet-latest'},
     },
     {
         'key': 'kilo',
@@ -121,6 +130,8 @@ CLI_TOOLS = [
         'auto_approve': [],
         'model_flag': '-m',
         'default_model': 'kilo/amazon/nova-micro-v1',  # parmi les moins chers
+        'models_by_tier': {'mini': 'kilo/amazon/nova-micro-v1',
+                           'strong': 'kilo/~anthropic/claude-sonnet-latest'},
     },
     {
         'key': 'vibe',
@@ -133,6 +144,7 @@ CLI_TOOLS = [
         'auto_approve': ['--agent', 'auto-approve'],
         'model_flag': None,  # pas de --model en CLI : configuré via `vibe --setup`
         'default_model': None,
+        'models_by_tier': None,
     },
     {
         'key': 'mistral',
@@ -145,6 +157,7 @@ CLI_TOOLS = [
         'auto_approve': ['--agent', 'auto-approve'],
         'model_flag': None,  # idem vibe
         'default_model': None,
+        'models_by_tier': None,
     }
 ]
 
@@ -400,6 +413,19 @@ def build_headless_argv(tool, prompt, with_actions=True):
         argv += tool.get('auto_approve', [])
     return argv
 
+def resolve_call_model(tool, complexity):
+    """Choisit le modèle d'un appel selon la complexité jugée par le cerveau.
+    Retourne (modèle, étiquette). Un modèle épinglé par l'utilisateur ([M])
+    a toujours la priorité — l'agent ne l'écrase pas."""
+    if tool.get('model_is_custom'):
+        return tool.get('model'), 'épinglé'
+    tiers = tool.get('models_by_tier') or {}
+    if str(complexity).lower().startswith('complex') and tiers.get('strong'):
+        return tiers['strong'], 'costaud'
+    if tiers.get('mini'):
+        return tiers['mini'], 'éco'
+    return tool.get('model'), 'défaut'
+
 def _quote_arg(a):
     if a == '' or any(c in a for c in ' "\t&|<>^'):
         return '"' + a.replace('"', "'") + '"'
@@ -508,10 +534,14 @@ def brain_next_action(query, installed, history, model):
         f"Historique des étapes :\n{_history_text(history)}\n\n"
         "Choisis la PROCHAINE action et réponds UNIQUEMENT en JSON strict :\n"
         '- Pour déléguer à un outil : '
-        '{"action":"call","cli":"<commande>","prompt":"<consigne précise en français pour cet outil>"}\n'
+        '{"action":"call","cli":"<commande>","prompt":"<consigne précise en français>",'
+        '"complexite":"simple|complexe"}\n'
         '- Si les résultats suffisent à répondre : '
         '{"action":"final","message":"<réponse finale claire pour l\'utilisateur>"}\n\n'
-        f"Le champ \"cli\" doit valoir EXACTEMENT l'une de : {valid}. "
+        f"Le champ \"cli\" doit valoir EXACTEMENT l'une de : {valid}.\n"
+        "\"complexite\" évalue la sous-tâche : \"simple\" (question courte, tâche directe "
+        "-> modèle économique) ou \"complexe\" (raisonnement poussé, code élaboré, "
+        "multi-étapes -> modèle plus puissant).\n"
         "Ne rappelle pas un outil pour une sous-tâche déjà traitée ; termine dès que possible."
     )
     try:
@@ -528,6 +558,8 @@ def brain_next_action(query, installed, history, model):
     if action == 'call':
         cli = str(d.get('cli', '')).strip().lower()
         sub = str(d.get('prompt', '')).strip()
+        complexity = str(d.get('complexite', 'simple')).strip().lower()
+        complexity = 'complexe' if complexity.startswith('complex') else 'simple'
         by_cmd = {t['command'].lower(): t for t in installed}
         tool = by_cmd.get(cli)
         if tool is None:  # repli tolérant : commande citée quelque part dans la réponse
@@ -537,7 +569,8 @@ def brain_next_action(query, installed, history, model):
                     tool = t
                     break
         if tool is not None:
-            return {'action': 'call', 'tool': tool, 'prompt': sub or query}
+            return {'action': 'call', 'tool': tool, 'prompt': sub or query,
+                    'complexity': complexity}
     return None
 
 def brain_synthesize(query, history, model):
@@ -716,6 +749,7 @@ def scan_tools():
             'auto_approve': tool.get('auto_approve', []),
             'model_flag': tool.get('model_flag'),
             'default_model': tool.get('default_model'),
+            'models_by_tier': tool.get('models_by_tier'),
             'model': effective_model,
             'model_is_custom': tool['command'] in overrides,
             'path': path,
@@ -857,10 +891,17 @@ def ask_agent(scanned):
         # 3) Sinon, préparer l'appel CLI et demander confirmation.
         tool = decision['tool']
         sub = decision['prompt']
+        complexity = decision.get('complexity', 'simple')
+        # Modèle choisi selon la complexité (sauf si l'utilisateur l'a épinglé).
+        chosen_model, tier_label = resolve_call_model(tool, complexity)
+        tool['model'] = chosen_model  # injecté dans build_headless_argv
         argv = build_headless_argv(tool, sub, with_actions=True)
         print(f"\n  {C_CYAN}━━ Étape {step} ━━{C_RESET}")
         print(f"  {C_GREEN}Outil{C_RESET}    : {C_BOLD}{tool['name']}{C_RESET} "
               f"({C_YELLOW}{tool['command']}{C_RESET})")
+        if tool.get('model_flag') and chosen_model:
+            print(f"  {C_GREEN}Modèle{C_RESET}   : {C_CYAN}{chosen_model}{C_RESET} "
+                  f"{C_DIM}(palier {tier_label} · tâche jugée « {complexity} »){C_RESET}")
         print(f"  {C_GREEN}Consigne{C_RESET} : {sub}")
         print(f"  {C_GREEN}Commande{C_RESET} : {C_DIM}{display_argv(argv)}{C_RESET}")
         if tool.get('auto_approve'):

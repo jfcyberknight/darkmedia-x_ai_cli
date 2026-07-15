@@ -45,7 +45,20 @@ Chaque CLI peut tourner avec le **modèle de votre choix**, et par défaut avec 
 - **Persistance** : vos choix sont enregistrés dans `ai_cli_models.json` (à côté du script, ignoré par git). Ce fichier prime sur les défauts.
 - Le modèle effectif s'affiche dans le tableau de bord (`[modèle: …]`, un `✱` marque un choix perso) et dans la commande headless montrée avant chaque appel de l'agent.
 
-> 💡 Les modèles « les moins chers » sont plus économiques mais parfois moins performants pour des tâches d'agent complexes. Montez en gamme via `[M]` si une tâche le nécessite.
+### 🤖 Choix automatique du modèle selon la tâche
+
+Quand vous **n'avez pas épinglé** de modèle pour un CLI, l'agent choisit le **palier** en fonction de la complexité qu'il juge pour la sous-tâche :
+
+| Complexité jugée | Palier | Exemples de modèle |
+|---|---|---|
+| **simple** (question courte, tâche directe) | `éco` | `haiku`, modèle gratuit, `nova-micro` |
+| **complexe** (raisonnement, code élaboré, multi-étapes) | `costaud` | `sonnet`, `qwen3.7-max`, `claude-sonnet-latest` |
+
+- Le palier retenu (`éco` / `costaud`) et la complexité jugée sont **affichés dans l'étape** avant confirmation.
+- **Si vous épinglez un modèle via `[M]`**, il est **toujours utilisé** (l'agent ne le remplace pas) — pratique pour forcer un modèle précis.
+- `agy` et `vibe`/`mistral` gèrent eux-mêmes leur modèle : pas de sélection automatique côté agent.
+
+> 💡 Les modèles « éco » sont moins chers mais parfois moins performants. L'auto-sélection monte en `costaud` pour les tâches complexes ; sinon, épinglez le modèle voulu via `[M]`.
 
 ### Prérequis de l'agent (optionnels)
 Pour le routage intelligent, installez Ollama et au moins un modèle :
