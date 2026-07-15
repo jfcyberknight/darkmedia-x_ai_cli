@@ -1,0 +1,6 @@
+# Config utilisateur (choix de modèle par CLI) — propre à chaque machine
+ai_cli_models.json
+
+# Python
+__pycache__/
+*.py[cod]

@@ -7,6 +7,12 @@ import shutil
 import subprocess
 import ctypes
 import time
+import json
+import re
+import queue
+import threading
+import urllib.request
+import urllib.error
 
 def enable_ansi():
     if sys.platform == 'win32':
@@ -44,49 +50,101 @@ C_YELLOW = "\033[33m"
 C_BLUE = "\033[34m"
 C_MAGENTA = "\033[35m"
 
-# Outils CLI à détecter
+# Outils CLI à détecter.
+#   'skills'        : points forts de l'outil (fournis au cerveau local pour le routage).
+#   'headless'      : gabarit d'arguments pour un appel NON-interactif (une commande ->
+#                     une réponse capturable). '{prompt}' est remplacé par la consigne.
+#   'auto_approve'  : arguments ajoutés pour donner à l'outil le droit d'exécuter des
+#                     actions sans demander (seulement après confirmation, à chaque appel).
+#   'model_flag'    : option pour imposer un modèle (None si le CLI ne le permet pas).
+#   'default_model' : modèle par défaut « le moins cher » (None = défaut natif du CLI).
+#                     Modifiable par l'utilisateur via le menu [M] (persisté dans un JSON).
 CLI_TOOLS = [
     {
         'key': 'agy',
         'name': 'Antigravity CLI',
         'command': 'agy',
-        'desc': 'Assistant de code Google DeepMind (Antigravity)'
+        'desc': 'Assistant de code Google DeepMind (Antigravity)',
+        'skills': ("Écosystème Google et Google Cloud (GCP) : créer/gérer des VPS et VMs "
+                   "(Compute Engine), déployer sur Google Cloud, Firebase, Cloud Run, "
+                   "essais/offres gratuites Google Cloud, services et APIs Google, Gemini."),
+        'headless': ['-p', '{prompt}'],
+        'auto_approve': ['--dangerously-skip-permissions'],
+        'model_flag': '--model',
+        'default_model': None,  # format du --model incertain -> laissé au défaut d'agy
     },
     {
         'key': 'claude',
         'name': 'Claude Code',
         'command': 'claude',
-        'desc': 'Assistant de code Anthropic Claude Code'
+        'desc': 'Assistant de code Anthropic Claude Code',
+        'skills': ("Agent de développement logiciel généraliste et polyvalent : écrire, "
+                   "refactorer et déboguer du code multi-langages, analyser une base de "
+                   "code, tâches d'ingénierie complexes, automatisation de dev. Choix par "
+                   "défaut quand aucun autre outil n'est clairement plus adapté."),
+        'headless': ['-p', '{prompt}'],
+        'auto_approve': ['--dangerously-skip-permissions'],
+        'model_flag': '--model',
+        'default_model': 'haiku',  # le moins cher chez Anthropic
     },
     {
         'key': 'opencode',
         'name': 'OpenCode CLI',
         'command': 'opencode',
-        'desc': 'Assistant de code OpenCode'
+        'desc': 'Assistant de code OpenCode',
+        'skills': ("Assistant de code open-source dans le terminal : édition de code, "
+                   "solution flexible/agnostique du fournisseur, alternative libre."),
+        'headless': ['run', '{prompt}'],
+        'auto_approve': [],
+        'model_flag': '-m',
+        'default_model': 'opencode/deepseek-v4-flash-free',  # gratuit
     },
     {
         'key': 'kilocode',
         'name': 'KiloCode CLI',
         'command': 'kilocode',
-        'desc': 'Assistant de code KiloCode'
+        'desc': 'Assistant de code KiloCode',
+        'skills': ("Assistant de code KiloCode : génération et édition de code, "
+                   "automatisation de tâches de développement."),
+        'headless': ['run', '{prompt}'],
+        'auto_approve': [],
+        'model_flag': '-m',
+        'default_model': 'kilo/amazon/nova-micro-v1',  # parmi les moins chers
     },
     {
         'key': 'kilo',
         'name': 'Kilo CLI',
         'command': 'kilo',
-        'desc': 'Raccourci/Alias de Kilo'
+        'desc': 'Raccourci/Alias de Kilo',
+        'skills': "Variante/alias de KiloCode : génération et édition de code.",
+        'headless': ['run', '{prompt}'],
+        'auto_approve': [],
+        'model_flag': '-m',
+        'default_model': 'kilo/amazon/nova-micro-v1',  # parmi les moins chers
     },
     {
         'key': 'vibe',
         'name': 'Mistral Vibe',
         'command': 'vibe',
-        'desc': 'Assistant de code officiel Mistral AI (Vibe)'
+        'desc': 'Assistant de code officiel Mistral AI (Vibe)',
+        'skills': ("Assistant de code officiel Mistral AI : génération de code avec les "
+                   "modèles Mistral, écosystème IA européen/français."),
+        'headless': ['-p', '{prompt}', '--trust'],
+        'auto_approve': ['--agent', 'auto-approve'],
+        'model_flag': None,  # pas de --model en CLI : configuré via `vibe --setup`
+        'default_model': None,
     },
     {
         'key': 'mistral',
         'name': 'Mistral CLI',
         'command': 'mistral',
-        'desc': 'Interface en ligne de commande Mistral AI'
+        'desc': 'Interface en ligne de commande Mistral AI',
+        'skills': ("Interface Mistral AI : chat et complétion de texte avec les modèles "
+                   "Mistral, questions générales."),
+        'headless': ['-p', '{prompt}', '--trust'],
+        'auto_approve': ['--agent', 'auto-approve'],
+        'model_flag': None,  # idem vibe
+        'default_model': None,
     }
 ]
 
@@ -96,6 +154,29 @@ EXTRA_PATHS = [
     os.path.expandvars(r'%USERPROFILE%\.local\bin'),
     os.path.expandvars(r'%LOCALAPPDATA%\agy\bin'),
 ]
+
+# Choix de modèle par CLI, persisté à côté du script ({commande: "modèle"}).
+# Une entrée ici prime sur 'default_model'. Éditable via le menu [M].
+MODEL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'ai_cli_models.json')
+
+def load_model_overrides():
+    try:
+        with open(MODEL_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if v}
+    except Exception:
+        pass
+    return {}
+
+def save_model_overrides(overrides):
+    try:
+        with open(MODEL_CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(overrides, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
 
 def find_tool_path(command_name):
     # Recherche dans le PATH standard
@@ -142,6 +223,447 @@ def get_tool_version(path):
         pass
     return "Inconnue"
 
+# ============================================================================
+#  AGENT DE ROUTAGE LOCAL
+#  Choisit automatiquement le meilleur CLI IA pour une demande en langage
+#  naturel. Utilise Ollama (100% local, sans abonnement cloud) comme cerveau,
+#  avec un repli sur un routage par mots-clés si le serveur Ollama est absent.
+# ============================================================================
+
+OLLAMA_HOST = "http://127.0.0.1:11434"
+
+def _http_get_json(url, timeout=3):
+    req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+def _http_post_json(url, payload, timeout=120):
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data,
+                                 headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+def ollama_models():
+    """Retourne la liste des modèles installés, [] si aucun, ou None si le
+    serveur Ollama est injoignable."""
+    try:
+        data = _http_get_json(f"{OLLAMA_HOST}/api/tags", timeout=2)
+        return [m.get('name', '') for m in data.get('models', [])]
+    except Exception:
+        return None
+
+def ensure_ollama():
+    """S'assure que le serveur Ollama tourne. Le démarre si nécessaire.
+    Retourne (ok: bool, model: str|None)."""
+    models = ollama_models()
+    if models is None and shutil.which('ollama'):
+        # Serveur éteint : tenter de le lancer en arrière-plan.
+        try:
+            creationflags = 0
+            if sys.platform == 'win32':
+                # DETACHED_PROCESS | CREATE_NO_WINDOW
+                creationflags = 0x00000008 | 0x08000000
+            subprocess.Popen(['ollama', 'serve'],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=creationflags)
+        except Exception:
+            pass
+        for _ in range(12):  # attendre jusqu'à ~7s que le serveur réponde
+            time.sleep(0.6)
+            models = ollama_models()
+            if models is not None:
+                break
+    if not models:
+        return False, None
+    # Préférer un modèle instruct/généraliste connu, sinon le premier disponible.
+    for name in models:
+        if any(k in name.lower() for k in ('gemma', 'qwen', 'llama', 'mistral', 'phi')):
+            return True, name
+    return True, models[0]
+
+def route_with_ollama(query, installed):
+    """Demande au modèle local quel CLI convient. Retourne un dict ou None."""
+    ok, model = ensure_ollama()
+    if not ok:
+        return None
+    tools_desc = "\n".join(f"- {t['command']} : {t['skills']}" for t in installed)
+    valid = ", ".join(t['command'] for t in installed)
+    prompt = (
+        "Tu es un routeur qui sélectionne le meilleur outil CLI d'IA pour "
+        "accomplir la tâche d'un utilisateur.\n\n"
+        "Outils disponibles (seuls ceux-ci sont installés) :\n"
+        f"{tools_desc}\n\n"
+        f"Tâche de l'utilisateur : \"{query}\"\n\n"
+        f"Choisis EXACTEMENT un outil dont la commande est parmi : {valid}.\n"
+        'Réponds uniquement en JSON strict, sans texte autour : '
+        '{"cli": "<commande>", "raison": "<phrase courte en français>"}'
+    )
+    try:
+        data = _http_post_json(f"{OLLAMA_HOST}/api/generate", {
+            "model": model,
+            "prompt": prompt,
+            "format": "json",
+            "stream": False,
+            "keep_alive": "5m",
+            "options": {"temperature": 0},
+        }, timeout=120)
+        raw = data.get('response', '').strip()
+        cli, reason = '', ''
+        try:
+            parsed = json.loads(raw)
+            cli = str(parsed.get('cli', '')).strip().lower()
+            reason = str(parsed.get('raison', '')).strip()
+        except Exception:
+            pass
+        # 1) Correspondance exacte sur la commande.
+        for t in installed:
+            if t['command'].lower() == cli:
+                return {'tool': t, 'reason': reason, 'engine': f'Ollama · {model}'}
+        # 2) Repli tolérant : le modèle a parfois renvoyé le nom de l'outil ou
+        #    un texte libre. On cherche une commande citée comme mot entier.
+        tokens = set(re.findall(r'[a-zàâçéèêëîïôûùüÿñæœ]+', (cli + ' ' + raw).lower()))
+        for t in installed:
+            if t['command'].lower() in tokens or t['name'].lower() in raw.lower():
+                return {'tool': t,
+                        'reason': reason or "Choisi par le modèle local.",
+                        'engine': f'Ollama · {model}'}
+    except Exception:
+        return None
+    return None
+
+# Routage de secours par mots-clés (utilisé si Ollama est indisponible).
+# Ordre = priorité : le premier outil installé dont un mot-clé apparaît gagne.
+KEYWORD_ROUTES = [
+    ('agy', ['google', 'gcp', 'vps', 'compute engine', 'gce', 'firebase',
+             'cloud run', 'google cloud', 'antigravity', 'deepmind', 'gemini']),
+    ('vibe', ['mistral', 'vibe']),
+    ('mistral', ['mistral cli']),
+    ('opencode', ['opencode', 'open source', 'open-source']),
+    ('kilocode', ['kilocode', 'kilo code']),
+    ('kilo', ['kilo']),
+    ('claude', ['claude', 'anthropic', 'refactor', 'debug', 'bug', 'code',
+                'coder', 'programme', 'développe', 'developpe', 'script',
+                'fonction', 'test']),
+]
+
+def route_with_keywords(query, installed):
+    q = query.lower()
+    by_cmd = {t['command']: t for t in installed}
+    for cmd, keywords in KEYWORD_ROUTES:
+        if cmd in by_cmd and any(k in q for k in keywords):
+            return {'tool': by_cmd[cmd],
+                    'reason': "Mot-clé reconnu dans la demande.",
+                    'engine': 'Règles (mots-clés)'}
+    # Défaut : Claude Code (généraliste) sinon le premier outil installé.
+    if 'claude' in by_cmd:
+        return {'tool': by_cmd['claude'],
+                'reason': "Choix par défaut (agent généraliste).",
+                'engine': 'Règles (défaut)'}
+    if installed:
+        return {'tool': installed[0],
+                'reason': "Choix par défaut (premier outil installé).",
+                'engine': 'Règles (défaut)'}
+    return None
+
+def route_query(query, scanned):
+    """Choisit le meilleur CLI installé pour la demande. Ollama d'abord,
+    repli sur les mots-clés."""
+    installed = [t for t in scanned if t['installed']]
+    if not installed:
+        return None
+    return route_with_ollama(query, installed) or route_with_keywords(query, installed)
+
+def copy_to_clipboard(text):
+    """Copie du texte dans le presse-papier Windows (best-effort)."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        subprocess.run('clip', input=text, text=True, shell=True,
+                       encoding='utf-8', errors='replace')
+        return True
+    except Exception:
+        return False
+
+# ---- Pilotage headless des CLIs (le cerveau les utilise comme des outils) ----
+
+def build_headless_argv(tool, prompt, with_actions=True):
+    """Construit la ligne de commande NON-interactive pour un outil, en
+    injectant le modèle choisi si le CLI le permet."""
+    argv = [tool['path']]
+    model = tool.get('model')
+    flag = tool.get('model_flag')
+    if model and flag:  # imposer le modèle (ex. --model haiku, -m provider/model)
+        argv += [flag, model]
+    argv += [a.replace('{prompt}', prompt) for a in tool.get('headless', ['{prompt}'])]
+    if with_actions:
+        argv += tool.get('auto_approve', [])
+    return argv
+
+def _quote_arg(a):
+    if a == '' or any(c in a for c in ' "\t&|<>^'):
+        return '"' + a.replace('"', "'") + '"'
+    return a
+
+def display_argv(argv):
+    """Version lisible/quotée d'un argv pour affichage à l'utilisateur."""
+    # On affiche le nom court de l'exécutable plutôt que son chemin complet.
+    shown = list(argv)
+    shown[0] = os.path.basename(shown[0])
+    return ' '.join(_quote_arg(a) for a in shown)
+
+def run_cli_headless(tool, prompt, timeout=300, with_actions=True, stream=False, indent="     "):
+    """Exécute un CLI en mode non-interactif et capture sa sortie.
+    Si stream=True, affiche la sortie en direct (ligne par ligne) pendant
+    l'exécution. Retourne {'ok': bool, 'output': str, 'code': int}.
+
+    La lecture se fait dans un thread + file d'attente : le délai (timeout)
+    est ainsi respecté même si le CLI ne produit aucune sortie."""
+    argv = build_headless_argv(tool, prompt, with_actions)
+    path = tool['path']
+    use_shell = path.lower().endswith(('.cmd', '.bat'))
+    cmd = ' '.join(_quote_arg(a) for a in argv) if use_shell else argv
+    try:
+        proc = subprocess.Popen(
+            cmd, shell=use_shell,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True, encoding='utf-8', errors='replace', bufsize=1,
+        )
+    except Exception as e:
+        return {'ok': False, 'output': f"<erreur de lancement : {e}>", 'code': -1}
+
+    q = queue.Queue()
+
+    def _reader():
+        try:
+            for line in proc.stdout:
+                q.put(line)
+        except Exception:
+            pass
+        finally:
+            q.put(None)  # sentinelle de fin
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+    collected = []
+    start = time.monotonic()
+    timed_out = False
+    while True:
+        remaining = timeout - (time.monotonic() - start)
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            line = q.get(timeout=min(1.0, remaining))
+        except queue.Empty:
+            continue  # rien reçu depuis 1s : on revérifie le délai
+        if line is None:
+            break  # le CLI a terminé
+        line = line.rstrip('\r\n')
+        collected.append(line)
+        if stream:
+            print(f"{indent}{C_DIM}{line}{C_RESET}")
+
+    if timed_out:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        collected.append(f"<délai dépassé après {timeout}s — l'outil a été interrompu>")
+        if stream:
+            print(f"{indent}{C_YELLOW}<délai dépassé — interrompu>{C_RESET}")
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+    code = proc.returncode if proc.returncode is not None else -1
+    output = "\n".join(collected).strip()
+    return {'ok': (code == 0 and not timed_out), 'output': output, 'code': code}
+
+def _history_text(history):
+    if not history:
+        return "(aucune étape effectuée pour l'instant)"
+    parts = []
+    for i, h in enumerate(history, 1):
+        out = h['output']
+        if len(out) > 1200:
+            out = out[:1200] + " …(tronqué)"
+        parts.append(f"Étape {i} — appel de `{h['cli']}` avec la consigne : {h['prompt']}\n"
+                     f"Résultat obtenu :\n{out}")
+    return "\n\n".join(parts)
+
+def brain_next_action(query, installed, history, model):
+    """Demande au cerveau local la prochaine action : appeler un outil, ou
+    terminer avec une réponse. Retourne un dict ou None."""
+    tools_desc = "\n".join(f"- {t['command']} : {t['skills']}" for t in installed)
+    valid = ", ".join(t['command'] for t in installed)
+    prompt = (
+        "Tu es un cerveau orchestrateur. Pour accomplir la demande de l'utilisateur, tu "
+        "délègues des sous-tâches à des outils CLI d'IA spécialisés, tu observes leurs "
+        "résultats, puis tu synthétises une réponse.\n\n"
+        f"Demande de l'utilisateur : \"{query}\"\n\n"
+        f"Outils disponibles :\n{tools_desc}\n\n"
+        f"Historique des étapes :\n{_history_text(history)}\n\n"
+        "Choisis la PROCHAINE action et réponds UNIQUEMENT en JSON strict :\n"
+        '- Pour déléguer à un outil : '
+        '{"action":"call","cli":"<commande>","prompt":"<consigne précise en français pour cet outil>"}\n'
+        '- Si les résultats suffisent à répondre : '
+        '{"action":"final","message":"<réponse finale claire pour l\'utilisateur>"}\n\n'
+        f"Le champ \"cli\" doit valoir EXACTEMENT l'une de : {valid}. "
+        "Ne rappelle pas un outil pour une sous-tâche déjà traitée ; termine dès que possible."
+    )
+    try:
+        data = _http_post_json(f"{OLLAMA_HOST}/api/generate", {
+            "model": model, "prompt": prompt, "format": "json",
+            "stream": False, "keep_alive": "5m", "options": {"temperature": 0.2},
+        }, timeout=180)
+        d = json.loads(data.get('response', '').strip())
+    except Exception:
+        return None
+    action = str(d.get('action', '')).strip().lower()
+    if action == 'final':
+        return {'action': 'final', 'message': str(d.get('message', '')).strip()}
+    if action == 'call':
+        cli = str(d.get('cli', '')).strip().lower()
+        sub = str(d.get('prompt', '')).strip()
+        by_cmd = {t['command'].lower(): t for t in installed}
+        tool = by_cmd.get(cli)
+        if tool is None:  # repli tolérant : commande citée quelque part dans la réponse
+            raw = json.dumps(d, ensure_ascii=False).lower()
+            for t in installed:
+                if re.search(rf'\b{re.escape(t["command"].lower())}\b', raw):
+                    tool = t
+                    break
+        if tool is not None:
+            return {'action': 'call', 'tool': tool, 'prompt': sub or query}
+    return None
+
+def brain_synthesize(query, history, model):
+    """Force une réponse finale à partir de l'historique (fin de boucle)."""
+    prompt = (
+        "Tu es un cerveau orchestrateur. À partir des résultats collectés auprès des "
+        "outils, rédige une réponse finale claire et utile, en français.\n\n"
+        f"Demande initiale : \"{query}\"\n\n"
+        f"Résultats des outils :\n{_history_text(history)}\n\n"
+        'Réponds UNIQUEMENT en JSON strict : {"message":"<ta réponse finale>"}'
+    )
+    try:
+        data = _http_post_json(f"{OLLAMA_HOST}/api/generate", {
+            "model": model, "prompt": prompt, "format": "json",
+            "stream": False, "keep_alive": "5m", "options": {"temperature": 0.3},
+        }, timeout=180)
+        return str(json.loads(data.get('response', '').strip()).get('message', '')).strip()
+    except Exception:
+        return ""
+
+def list_cli_models(tool):
+    """Retourne la liste des modèles disponibles pour un CLI (ou None)."""
+    cmd = tool['command']
+    if cmd == 'claude':  # pas de sous-commande `models` : alias connus
+        return ['haiku', 'sonnet', 'opus', '(ou un ID complet, ex. claude-haiku-4-5)']
+    if tool.get('model_flag') is None:
+        return None
+    path = tool['path']
+    try:
+        if path.lower().endswith(('.cmd', '.bat')):
+            res = subprocess.run(f'"{path}" models', shell=True, capture_output=True,
+                                 text=True, timeout=30, stdin=subprocess.DEVNULL,
+                                 encoding='utf-8', errors='replace')
+        else:
+            res = subprocess.run([path, 'models'], capture_output=True, text=True,
+                                 timeout=30, stdin=subprocess.DEVNULL,
+                                 encoding='utf-8', errors='replace')
+        lines = [l.strip() for l in (res.stdout or '').splitlines() if l.strip()]
+        return lines or None
+    except Exception:
+        return None
+
+def configure_models(scanned):
+    """Menu [M] : choisir le modèle utilisé par chaque CLI (persisté en JSON)."""
+    installed = [t for t in scanned if t['installed']]
+    overrides = load_model_overrides()
+    while True:
+        os.system('cls' if os.name == 'nt' else 'clear')
+        print(f"\n{C_CYAN}  ┌────────────────────────────────────────────────────────┐{C_RESET}")
+        print(f"{C_CYAN}  │      ⚙  MODÈLE PAR CLI  (défaut = le moins cher)       │{C_RESET}")
+        print(f"{C_CYAN}  └────────────────────────────────────────────────────────┘{C_RESET}\n")
+        for idx, t in enumerate(installed, 1):
+            if t.get('model_flag') is None:
+                cur = f"{C_DIM}non configurable en CLI (voir la config du CLI){C_RESET}"
+            else:
+                mdl = overrides.get(t['command']) or t.get('default_model')
+                if mdl:
+                    tag = "choisi" if t['command'] in overrides else "défaut"
+                    cur = f"{C_CYAN}{mdl}{C_RESET} {C_DIM}({tag}){C_RESET}"
+                else:
+                    cur = f"{C_DIM}défaut natif du CLI{C_RESET}"
+            print(f"  {C_BOLD}[{idx}]{C_RESET} {t['name']:<16} : {cur}")
+        print(f"\n  {C_BOLD}[Q]{C_RESET} Retour au tableau de bord")
+        try:
+            choice = input(f"\n  {C_CYAN}👉 Numéro du CLI à configurer (Q = retour) : {C_RESET}").strip().lower()
+        except KeyboardInterrupt:
+            return
+        if choice in ('q', ''):
+            return
+        try:
+            idx = int(choice) - 1
+        except ValueError:
+            continue
+        if not (0 <= idx < len(installed)):
+            continue
+        tool = installed[idx]
+        if tool.get('model_flag') is None:
+            print(f"\n  {C_YELLOW}⚠ {tool['name']} ne permet pas de choisir le modèle en ligne "
+                  f"de commande.{C_RESET}")
+            print(f"  {C_DIM}(Configure-le dans l'outil, ex. « vibe --setup ».){C_RESET}")
+            time.sleep(2.5)
+            continue
+
+        models = None
+        try:
+            ans = input(f"\n  {C_CYAN}[L] lister les modèles disponibles, ou Entrée pour saisir "
+                        f"directement : {C_RESET}").strip().lower()
+        except KeyboardInterrupt:
+            continue
+        if ans == 'l':
+            print(f"  {C_DIM}⏳ Récupération des modèles ({tool['command']} models)...{C_RESET}")
+            models = list_cli_models(tool)
+            if models:
+                for i, mdl in enumerate(models, 1):
+                    print(f"     {C_DIM}{i:>3}.{C_RESET} {mdl}")
+            else:
+                print(f"  {C_YELLOW}(Liste indisponible — saisis le nom du modèle à la main.){C_RESET}")
+
+        cur_default = tool.get('default_model') or "défaut natif"
+        try:
+            val = input(f"\n  {C_CYAN}Modèle pour {tool['name']} (numéro de la liste, nom exact, "
+                        f"'d' = défaut « {cur_default} », vide = annuler) : {C_RESET}").strip()
+        except KeyboardInterrupt:
+            continue
+        if not val:
+            continue
+        if val.lower() in ('d', 'defaut', 'défaut', 'reset'):
+            overrides.pop(tool['command'], None)
+        else:
+            picked = None
+            if models and val.isdigit():
+                n = int(val)
+                if 1 <= n <= len(models):
+                    picked = models[n - 1]
+            chosen = picked or val
+            if chosen.startswith('('):  # ligne d'aide, pas un vrai modèle
+                print(f"  {C_YELLOW}Sélection invalide.{C_RESET}")
+                time.sleep(1.5)
+                continue
+            overrides[tool['command']] = chosen
+        if save_model_overrides(overrides):
+            print(f"\n  {C_GREEN}✔ Enregistré.{C_RESET}")
+        else:
+            print(f"\n  {C_RED}⚠ Échec de l'enregistrement.{C_RESET}")
+        time.sleep(1.2)
+
 def create_desktop_shortcut():
     desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
     shortcut_path = os.path.join(desktop, 'Mes CLI IA.lnk')
@@ -179,13 +701,23 @@ def check_and_create_shortcut():
 
 def scan_tools():
     scanned = []
+    overrides = load_model_overrides()
     for tool in CLI_TOOLS:
         path = find_tool_path(tool['command'])
         version = get_tool_version(path) if path else "N/A"
+        # Modèle effectif : choix utilisateur (JSON) sinon défaut « moins cher ».
+        effective_model = overrides.get(tool['command']) or tool.get('default_model')
         scanned.append({
             'name': tool['name'],
             'command': tool['command'],
             'desc': tool['desc'],
+            'skills': tool.get('skills', ''),
+            'headless': tool.get('headless', ['{prompt}']),
+            'auto_approve': tool.get('auto_approve', []),
+            'model_flag': tool.get('model_flag'),
+            'default_model': tool.get('default_model'),
+            'model': effective_model,
+            'model_is_custom': tool['command'] in overrides,
             'path': path,
             'version': version,
             'installed': path is not None
@@ -220,29 +752,41 @@ def print_dashboard(scanned):
         
         # Sous-titre
         if tool['installed']:
-            print(f"       {C_DIM}↳ {tool['desc']} (Path: {tool['path']}){C_RESET}")
+            if tool.get('model_flag') and tool.get('model'):
+                mtag = "✱" if tool.get('model_is_custom') else ""
+                minfo = f" {C_MAGENTA}[modèle: {tool['model']}{mtag}]{C_DIM}"
+            else:
+                minfo = ""
+            print(f"       {C_DIM}↳ {tool['desc']}{minfo} (Path: {tool['path']}){C_RESET}")
         else:
             print(f"       {C_DIM}↳ {tool['desc']} (Non détecté){C_RESET}")
             
     print(f"\n  {C_DIM}------------------------------------------------------------------------{C_RESET}")
     return installed_count
 
-def run_tool(tool):
+def run_tool(tool, prompt=None):
     path = tool['path']
     cmd_name = tool['command']
     print(f"\n{C_CYAN}⚡ Lancement de {tool['name']} ({cmd_name})...{C_RESET}")
     print(f"{C_DIM}Dossier de travail actuel : {os.getcwd()}{C_RESET}")
+    if prompt:
+        print(f"{C_DIM}Demande transmise : {prompt}{C_RESET}")
     print(f"{C_DIM}Appuyez sur Ctrl+C ou quittez l'outil pour revenir au tableau de bord.{C_RESET}\n")
     time.sleep(0.5)
-    
+
     try:
-        # Exécuter de manière interactive
+        # Exécuter de manière interactive, en transmettant éventuellement la
+        # demande de l'agent comme argument positionnel.
         if path.lower().endswith(('.cmd', '.bat')):
-            subprocess.run([path], shell=True)
+            cmd = f'"{path}" "{prompt}"' if prompt else f'"{path}"'
+            subprocess.run(cmd, shell=True)
         elif path.lower().endswith('.ps1'):
-            subprocess.run(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path])
+            args = ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path]
+            if prompt:
+                args.append(prompt)
+            subprocess.run(args)
         else:
-            subprocess.run([path])
+            subprocess.run([path, prompt] if prompt else [path])
     except KeyboardInterrupt:
         # Capturer l'interruption Ctrl+C si elle se propage à Python
         pass
@@ -252,6 +796,114 @@ def run_tool(tool):
         
     print(f"\n{C_GREEN}✓ Retour au tableau de bord de {tool['name']}.{C_RESET}")
     time.sleep(1.2)
+
+AGENT_MAX_STEPS = 5  # garde-fou : nombre maxi d'appels CLI par demande
+
+def ask_agent(scanned):
+    """Orchestrateur : le cerveau local pilote les CLIs en mode headless
+    (sans les ouvrir), capture leurs sorties, enchaîne les étapes et synthétise.
+    Chaque appel CLI est confirmé par l'utilisateur avant exécution."""
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print(f"\n{C_MAGENTA}  ┌────────────────────────────────────────────────────────┐{C_RESET}")
+    print(f"{C_MAGENTA}  │     🧠 AGENT IA LOCAL — orchestrateur (headless)       │{C_RESET}")
+    print(f"{C_MAGENTA}  └────────────────────────────────────────────────────────┘{C_RESET}\n")
+    print(f"  {C_DIM}Le cerveau appelle les CLIs comme des outils, récupère leurs réponses{C_RESET}")
+    print(f"  {C_DIM}et enchaîne les étapes. Tu confirmes chaque appel avant exécution.{C_RESET}")
+    print(f"  {C_DIM}Exemple : « crée-moi un VPS gratuit sur Google »{C_RESET}\n")
+
+    installed = [t for t in scanned if t['installed']]
+    if not installed:
+        print(f"  {C_RED}⚠ Aucun CLI IA installé n'est disponible.{C_RESET}")
+        time.sleep(2)
+        return
+
+    try:
+        query = input(f"  {C_CYAN}🗣  Ta demande (vide = retour) : {C_RESET}").strip()
+    except KeyboardInterrupt:
+        return
+    if not query:
+        return
+
+    ok, model = ensure_ollama()
+    if ok:
+        print(f"\n  {C_DIM}Cerveau : Ollama · {model}{C_RESET}")
+    else:
+        print(f"\n  {C_YELLOW}Cerveau local (Ollama) indisponible → routage de secours par "
+              f"mots-clés, une seule étape.{C_RESET}")
+
+    history = []          # [{cli, prompt, output}]
+    final_message = None
+
+    for step in range(1, AGENT_MAX_STEPS + 1):
+        # 1) Décider de la prochaine action.
+        decision = None
+        if ok:
+            print(f"\n  {C_DIM}⏳ Le cerveau réfléchit à la prochaine étape...{C_RESET}")
+            decision = brain_next_action(query, installed, history, model)
+        if decision is None:
+            # Repli : sans cerveau, on route une seule fois par mots-clés.
+            if not history:
+                r = route_with_keywords(query, installed)
+                if r:
+                    decision = {'action': 'call', 'tool': r['tool'], 'prompt': query}
+            if decision is None:
+                break
+
+        # 2) Terminer si le cerveau a une réponse.
+        if decision['action'] == 'final':
+            final_message = decision.get('message') or ""
+            break
+
+        # 3) Sinon, préparer l'appel CLI et demander confirmation.
+        tool = decision['tool']
+        sub = decision['prompt']
+        argv = build_headless_argv(tool, sub, with_actions=True)
+        print(f"\n  {C_CYAN}━━ Étape {step} ━━{C_RESET}")
+        print(f"  {C_GREEN}Outil{C_RESET}    : {C_BOLD}{tool['name']}{C_RESET} "
+              f"({C_YELLOW}{tool['command']}{C_RESET})")
+        print(f"  {C_GREEN}Consigne{C_RESET} : {sub}")
+        print(f"  {C_GREEN}Commande{C_RESET} : {C_DIM}{display_argv(argv)}{C_RESET}")
+        if tool.get('auto_approve'):
+            print(f"  {C_YELLOW}⚠ S'exécutera avec droits d'action (auto-approbation des outils).{C_RESET}")
+
+        try:
+            confirm = input(f"  {C_CYAN}👉 Exécuter cette étape ? "
+                            f"[{C_BOLD}O{C_RESET}{C_CYAN}/n] : {C_RESET}").strip().lower()
+        except KeyboardInterrupt:
+            break
+        if confirm in ('n', 'non', 'no'):
+            print(f"  {C_YELLOW}Étape refusée — arrêt de l'orchestration.{C_RESET}")
+            break
+
+        # 4) Exécuter en headless, en affichant la sortie EN DIRECT.
+        print(f"\n  {C_DIM}⏳ Exécution — sortie en direct de {tool['command']} "
+              f"(peut prendre un moment) :{C_RESET}")
+        res = run_cli_headless(tool, sub, timeout=300, with_actions=True, stream=True)
+        out = res['output'] or "(aucune sortie)"
+        tag = f"{C_GREEN}OK{C_RESET}" if res['ok'] else f"{C_RED}échec (code {res['code']}){C_RESET}"
+        print(f"\n  {C_CYAN}━━ Fin de l'étape {step} [{tag}{C_CYAN}] ━━{C_RESET}")
+        history.append({'cli': tool['command'], 'prompt': sub, 'output': out})
+
+        if not ok:  # pas de cerveau → une seule étape
+            break
+
+    # 5) Réponse finale : celle du cerveau, sinon une synthèse forcée.
+    if final_message is None and history and ok:
+        print(f"\n  {C_DIM}⏳ Synthèse finale...{C_RESET}")
+        final_message = brain_synthesize(query, history, model)
+
+    if final_message:
+        print(f"\n  {C_MAGENTA}🧠 Réponse de l'agent :{C_RESET}")
+        print(f"  {final_message}")
+    elif history:
+        print(f"\n  {C_DIM}Vois les résultats des étapes ci-dessus.{C_RESET}")
+    else:
+        print(f"\n  {C_RED}⚠ Aucune action n'a pu être effectuée pour cette demande.{C_RESET}")
+
+    try:
+        input(f"\n  {C_DIM}Appuyez sur Entrée pour revenir au tableau de bord...{C_RESET}")
+    except KeyboardInterrupt:
+        pass
 
 def main():
     # Définir le titre de la console Windows
@@ -270,12 +922,14 @@ def main():
         scanned = scan_tools()
         print_dashboard(scanned)
         
-        print(f"  {C_BOLD}[Q]{C_RESET} Quitter le tableau de bord")
+        print(f"  {C_MAGENTA}{C_BOLD}[A]{C_RESET} 🧠 Demander à l'agent IA (langage naturel — choix auto du CLI)")
+        print(f"  {C_BOLD}[M]{C_RESET} ⚙  Choisir le modèle par CLI")
         print(f"  {C_BOLD}[R]{C_RESET} Actualiser la liste")
+        print(f"  {C_BOLD}[Q]{C_RESET} Quitter le tableau de bord")
         print()
-        
+
         try:
-            choice = input(f"  {C_CYAN}👉 Votre choix (N° ou Q) : {C_RESET}").strip().lower()
+            choice = input(f"  {C_CYAN}👉 Votre choix (N°, A, M, R ou Q) : {C_RESET}").strip().lower()
         except KeyboardInterrupt:
             print(f"\n\n{C_GREEN}Au revoir !{C_RESET}")
             time.sleep(0.8)
@@ -285,6 +939,12 @@ def main():
             print(f"\n{C_GREEN}Au revoir !{C_RESET}")
             time.sleep(0.8)
             break
+        elif choice == 'a':
+            ask_agent(scanned)
+            continue
+        elif choice == 'm':
+            configure_models(scanned)
+            continue
         elif choice == 'r':
             print("\nActualisation...")
             time.sleep(0.5)

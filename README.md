@@ -5,9 +5,56 @@ Un tableau de bord interactif en Python pour lister, vérifier la version et lan
 ## 🚀 Fonctionnalités
 - **Détection Automatique** : Recherche vos outils IA dans le `PATH` système ainsi que dans les dossiers d'installation courants (`AppData`, `.local/bin`, shims global NPM, etc.).
 - **Vérification de Version** : Exécute automatiquement chaque outil en arrière-plan avec le flag `--version` pour afficher la version installée.
+- **🧠 Agent IA local (orchestrateur)** : Décrivez votre tâche en langage naturel (option `[A]`) et un cerveau local **pilote les CLIs comme des outils**, en headless : il choisit le bon CLI, rédige un sous-prompt précis, l'exécute (après votre confirmation), **récupère la sortie**, enchaîne d'autres étapes si besoin, puis synthétise une réponse. Il n'ouvre jamais de session interactive — le cerveau garde le contrôle. *Ex : « crée-moi un VPS gratuit sur Google » → délègue à `agy`.*
 - **Raccourci Bureau** : Crée automatiquement un raccourci direct (« Mes CLI IA ») sur votre bureau lors du premier lancement.
 - **Menu Interactif** : Permet de lancer directement l'outil de votre choix sans quitter la console actuelle.
 - **Support des Emojis et Couleurs** : Rendu visuel propre et moderne avec des couleurs ANSI supportant le codage UTF-8.
+
+## 🧠 Agent IA local — 100% autonome, sans abonnement cloud
+
+L'option `[A]` du tableau de bord transforme le script en **agent orchestrateur** : vous posez une tâche en français, et un cerveau local **pilote les CLIs comme des outils** au lieu de simplement les ouvrir.
+
+**Le cycle, à chaque étape :**
+1. Le cerveau choisit le CLI le plus adapté et **rédige lui-même une consigne précise** pour lui.
+2. Il vous montre le CLI + la consigne + la commande headless exacte, et **attend votre confirmation** (chaque appel est validé).
+3. Il exécute le CLI en mode **non-interactif** (`claude -p`, `agy -p`, `opencode run`, `vibe -p`, …), affiche sa **sortie en direct** (streaming ligne par ligne), la **capture**, et l'analyse.
+4. Il enchaîne éventuellement d'autres CLIs, puis **synthétise une réponse finale**.
+
+Ainsi le cerveau ne « cède » jamais la main à une session interactive : il garde le contrôle et combine les résultats — c'est là toute la force de l'orchestration.
+
+- **Cerveau local via [Ollama](https://ollama.com)** : les décisions sont prises par un modèle exécuté sur votre machine (aucune clé API, aucun abonnement, aucune donnée envoyée dans le cloud). Le serveur Ollama est démarré automatiquement si besoin.
+- **Droits d'action** : après votre confirmation, le CLI s'exécute avec auto-approbation (`--dangerously-skip-permissions`, `--agent auto-approve`…) pour pouvoir réellement agir. Vous gardez la main grâce à la confirmation à chaque étape (limitée par `AGENT_MAX_STEPS`).
+- **Repli par mots-clés** : si Ollama est absent ou éteint, un routage par mots-clés en une seule étape prend le relais — l'agent reste utilisable.
+- **Comment ça marche** : chaque outil de `CLI_TOOLS` porte un champ `skills` (ses points forts) et un gabarit `headless` (comment l'appeler sans interface). Le modèle local reçoit ce contexte + l'historique des étapes et renvoie, en JSON, soit un appel d'outil, soit la réponse finale.
+
+> ⚠️ **Note** : les CLIs délégués (Claude, agy, Vibe…) utilisent leurs propres identifiants/API. Assurez-vous qu'ils sont configurés pour que l'agent puisse les piloter.
+
+## 🎚️ Choix du modèle par CLI (option `[M]`)
+
+Chaque CLI peut tourner avec le **modèle de votre choix**, et par défaut avec **le modèle le moins cher** :
+
+| CLI | Flag utilisé | Modèle par défaut (le moins cher) |
+|---|---|---|
+| `claude` | `--model` | `haiku` |
+| `opencode` | `-m` | `opencode/deepseek-v4-flash-free` *(gratuit)* |
+| `kilocode` / `kilo` | `-m` | `kilo/amazon/nova-micro-v1` |
+| `agy` | `--model` | défaut natif d'agy *(choisissable dans `[M]`)* |
+| `vibe` / `mistral` | — | non modifiable en CLI *(réglez-le via `vibe --setup`)* |
+
+- **Configurer** : menu `[M]` → choisissez un CLI → `[L]` liste les modèles réellement disponibles (`<cli> models`) → tapez le numéro ou le nom exact (ou `d` pour revenir au défaut).
+- **Persistance** : vos choix sont enregistrés dans `ai_cli_models.json` (à côté du script, ignoré par git). Ce fichier prime sur les défauts.
+- Le modèle effectif s'affiche dans le tableau de bord (`[modèle: …]`, un `✱` marque un choix perso) et dans la commande headless montrée avant chaque appel de l'agent.
+
+> 💡 Les modèles « les moins chers » sont plus économiques mais parfois moins performants pour des tâches d'agent complexes. Montez en gamme via `[M]` si une tâche le nécessite.
+
+### Prérequis de l'agent (optionnels)
+Pour le routage intelligent, installez Ollama et au moins un modèle :
+```bash
+# Installer Ollama (https://ollama.com/download), puis récupérer un modèle :
+ollama pull gemma4
+# Un modèle plus léger accélère le routage (ex. llama3.2:3b, qwen2.5:3b).
+```
+> Sans Ollama, l'agent reste utilisable grâce au repli par mots-clés.
 
 ## 🤖 Outils pris en charge
 * **Antigravity CLI** (`agy`)
