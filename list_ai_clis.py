@@ -1072,12 +1072,38 @@ VPS_CONFIG = {
     'name_prefix': 'ai-ephemeral',
     'work_dir': '~/work',
     'default_repo': 'https://github.com/jfcyberknight/apartment-repair-tracker.git',
+    'default_agent': 'claude',
+    'default_task': ("Analyse le projet, puis résume-le et propose des améliorations "
+                     "concrètes dans un fichier NOTES_IA.md."),
+}
+
+# Agents installables/exécutables SUR la VM (étape 5 autonome).
+#   'install' : commande shell pour installer l'agent sur Debian 12.
+#   'run'     : commande headless ({task} = consigne). Doit tourner sans interaction.
+#   'env'     : variables d'environnement d'auth requises (lues en local, transmises
+#               par SSH, JAMAIS affichées). Une VM headless exige une clé API.
+VM_AGENTS = {
+    'claude': {
+        'name': 'Claude Code',
+        'install': ('curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - '
+                    '&& sudo apt-get install -y nodejs '
+                    '&& sudo npm install -g @anthropic-ai/claude-code'),
+        'run': 'claude -p {task} --dangerously-skip-permissions',
+        'env': ['ANTHROPIC_API_KEY'],
+    },
+    'opencode': {
+        'name': 'OpenCode',
+        'install': 'curl -fsSL https://opencode.ai/install | bash',
+        'run': 'opencode run {task}',
+        'env': ['OPENCODE_API_KEY'],   # best-effort : adapte selon ton fournisseur
+    },
 }
 
 def build_vps_plan(c):
     """Construit le plan (label, note, commande affichable) du cycle de vie."""
     pub = f'{c["key_path"]}.pub'
-    return [
+    ssh = f'ssh -i "{c["key_path"]}" -o StrictHostKeyChecking=no {c["ssh_user"]}@<IP_VM>'
+    steps = [
         ("1. Clé SSH éphémère",
          "Paire de clés jetable, supprimée en fin de session.",
          f'ssh-keygen -t ed25519 -f "{c["key_path"]}" -N "" -C "ai-ephemeral"'),
@@ -1093,11 +1119,29 @@ def build_vps_plan(c):
          f'--format="get(networkInterfaces[0].accessConfigs[0].natIP)"'),
         ("4. Clonage du dépôt sur la VM",
          "Connexion SSH + git clone dans le dossier de travail.",
-         f'ssh -i "{c["key_path"]}" -o StrictHostKeyChecking=no {c["ssh_user"]}@<IP_VM> '
-         f'"git clone {c["repo"]} {c["work_dir"]}"'),
-        ("5. Travail de l'agent (personnalisable)",
-         "Emplacement où lancer ton CLI-agent sur la VM (à installer/choisir).",
-         f'ssh -i "{c["key_path"]}" {c["ssh_user"]}@<IP_VM> "cd {c["work_dir"]} && <ton agent>"'),
+         f'{ssh} "git clone {c["repo"]} {c["work_dir"]}"'),
+    ]
+    if c.get('autonomous'):
+        agent = VM_AGENTS.get(c.get('agent_cli'), VM_AGENTS['claude'])
+        envs = ' '.join(f'{e}=***' for e in agent['env'])
+        run_tpl = agent['run'].replace('{task}', f'"{c.get("task", "")}"')
+        steps += [
+            ("5a. Installer l'agent sur la VM",
+             f"Installe {agent['name']} sur la VM (Node.js + npm).",
+             f'{ssh} "{agent["install"]}"'),
+            ("5b. Lancer l'agent en autonome (headless)",
+             "Clé API passée par variable d'environnement (JAMAIS affichée).",
+             f'{ssh} "cd {c["work_dir"]} && {envs} {run_tpl}"'),
+            ("5c. Récupérer le travail en local",
+             "Rapatrie le diff avant la destruction — tu gardes le résultat.",
+             f'{ssh} "cd {c["work_dir"]} && git add -A && git diff --cached" > {c["name"]}-changes.patch'),
+        ]
+    else:
+        steps.append(
+            ("5. Travail manuel (SSH)",
+             "Tu te connectes et tu bosses toi-même dans la VM.",
+             f'{ssh}   # puis : cd {c["work_dir"]}'))
+    steps += [
         ("6. Destruction de la VM (nettoyage sécurisé)",
          "Supprime l'instance ET ses disques : aucune trace ne subsiste.",
          f'gcloud compute instances delete {c["name"]} --zone={c["zone"]} '
@@ -1106,18 +1150,27 @@ def build_vps_plan(c):
          "Efface la clé éphémère de ta machine (fait en Python via os.remove).",
          f'del "{c["key_path"]}" "{pub}"'),
     ]
+    return steps
 
 def _vps_context(repo):
     name = f'{VPS_CONFIG["name_prefix"]}-{time.strftime("%Y%m%d-%H%M%S")}'
     key_path = os.path.join(tempfile.gettempdir(), name)
     ctx = dict(VPS_CONFIG)
-    ctx.update({'name': name, 'repo': repo, 'key_path': key_path})
+    ctx.update({'name': name, 'repo': repo, 'key_path': key_path,
+                'autonomous': False, 'agent_cli': VPS_CONFIG['default_agent'],
+                'task': VPS_CONFIG['default_task']})
     return ctx
 
 def print_vps_plan(ctx):
     plan = build_vps_plan(ctx)
     print(f"\n  {C_BOLD}Plan de session — VM « {ctx['name']} »{C_RESET}")
-    print(f"  {C_DIM}Repo : {ctx['repo']}{C_RESET}\n")
+    print(f"  {C_DIM}Repo : {ctx['repo']}{C_RESET}")
+    if ctx.get('autonomous'):
+        agent = VM_AGENTS.get(ctx.get('agent_cli'), VM_AGENTS['claude'])
+        print(f"  {C_DIM}Mode : autonome · agent {agent['name']} · tâche : {ctx.get('task')}{C_RESET}")
+    else:
+        print(f"  {C_DIM}Mode : manuel (tu bosses toi-même en SSH){C_RESET}")
+    print()
     for label, note, cmd in plan:
         print(f"  {C_CYAN}{label}{C_RESET}")
         print(f"     {C_DIM}{note}{C_RESET}")
@@ -1144,6 +1197,27 @@ def run_vps_session(scanned):
         repo = VPS_CONFIG['default_repo']
 
     ctx = _vps_context(repo)
+
+    # Mode autonome : l'agent s'installe et travaille seul dans la VM.
+    try:
+        auto = input(f"  {C_CYAN}Mode autonome (l'agent bosse seul dans la VM) ? "
+                     f"[{C_BOLD}O{C_RESET}{C_CYAN}/n] : {C_RESET}").strip().lower()
+    except KeyboardInterrupt:
+        return
+    if auto not in ('n', 'non', 'no'):
+        ctx['autonomous'] = True
+        choix = ' / '.join(VM_AGENTS.keys())
+        try:
+            a = input(f"  {C_CYAN}Agent à exécuter sur la VM [{choix}] (défaut "
+                      f"{VPS_CONFIG['default_agent']}) : {C_RESET}").strip().lower()
+            if a in VM_AGENTS:
+                ctx['agent_cli'] = a
+            t = input(f"  {C_CYAN}Tâche pour l'agent (Entrée = défaut) : {C_RESET}").strip()
+            if t:
+                ctx['task'] = t
+        except KeyboardInterrupt:
+            return
+
     print_vps_plan(ctx)
 
     print(f"\n  {C_YELLOW}▲ DRY-RUN : aucune des commandes ci-dessus n'a été exécutée.{C_RESET}")
@@ -1182,6 +1256,16 @@ def _run(argv, **kw):
     return subprocess.run(argv, capture_output=True, text=True,
                           encoding='utf-8', errors='replace', **kw)
 
+def _shq(s):
+    """Échappe une chaîne pour le shell bash distant (guillemets simples)."""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+def _ssh(key, target, remote_cmd, timeout=None):
+    """Exécute une commande sur la VM via SSH et capture la sortie."""
+    return _run(['ssh', '-i', key, '-o', 'StrictHostKeyChecking=no',
+                 '-o', 'UserKnownHostsFile=/dev/null', target, remote_cmd],
+                timeout=timeout)
+
 def _vps_execute_live(ctx, gcloud):
     """Exécute réellement le cycle de vie. Destruction garantie (finally)."""
     key = ctx['key_path']
@@ -1218,19 +1302,54 @@ def _vps_execute_live(ctx, gcloud):
         print(f"     {C_GREEN}IP : {ip}{C_RESET}")
 
         # 4) Clonage du dépôt (petite attente que SSH soit prêt)
-        print(f"  {C_CYAN}[4/5] Clonage du dépôt sur la VM (attente du démarrage SSH)...{C_RESET}")
+        print(f"  {C_CYAN}[4] Clonage du dépôt sur la VM (attente du démarrage SSH)...{C_RESET}")
         time.sleep(20)
         ssh_target = f'{ctx["ssh_user"]}@{ip}'
-        r = _run(['ssh', '-i', key, '-o', 'StrictHostKeyChecking=no',
-                  '-o', 'UserKnownHostsFile=/dev/null', ssh_target,
-                  f'git clone {ctx["repo"]} {ctx["work_dir"]}'])
-        print(f"     {C_DIM}{(r.stdout or r.stderr).strip()[:600]}{C_RESET}")
+        r = _ssh(key, ssh_target, f'git clone {ctx["repo"]} {ctx["work_dir"]}', timeout=120)
+        print(f"     {C_DIM}{(r.stdout or r.stderr).strip()[:400]}{C_RESET}")
 
-        # 5) Main à l'utilisateur pour travailler dans la VM
-        print(f"\n  {C_GREEN}[5/5] VM prête. Connecte-toi pour travailler :{C_RESET}")
-        print(f'     {C_YELLOW}ssh -i "{key}" {ssh_target}{C_RESET}')
-        print(f"     {C_DIM}(repo cloné dans {ctx['work_dir']}){C_RESET}")
-        input(f"\n  {C_CYAN}👉 Appuie sur Entrée quand tu as terminé pour DÉTRUIRE la VM...{C_RESET}")
+        # 5) Travail dans la VM : autonome (l'agent bosse seul) ou manuel.
+        if ctx.get('autonomous'):
+            agent = VM_AGENTS.get(ctx.get('agent_cli'), VM_AGENTS['claude'])
+            missing = [e for e in agent['env'] if not os.environ.get(e)]
+            if missing:
+                print(f"\n  {C_YELLOW}⚠ Variable(s) d'auth manquante(s) : {', '.join(missing)} "
+                      f"→ étape agent sautée.{C_RESET}")
+                print(f"  {C_DIM}Définis-la localement puis relance, ex. : "
+                      f"setx {agent['env'][0]} <ta_clé>{C_RESET}")
+            else:
+                print(f"\n  {C_CYAN}[5a] Installation de {agent['name']} sur la VM (1-2 min)...{C_RESET}")
+                r = _ssh(key, ssh_target, agent['install'], timeout=300)
+                print(f"     {C_DIM}{(r.stdout or r.stderr).strip()[-300:]}{C_RESET}")
+
+                # Auth transmise par variable d'env : construite ici, JAMAIS affichée.
+                envprefix = ' '.join(f"{e}={_shq(os.environ[e])}" for e in agent['env'])
+                runcmd = agent['run'].replace('{task}', _shq(ctx['task']))
+                print(f"  {C_CYAN}[5b] {agent['name']} travaille en autonome (headless ; "
+                      f"clé API transmise, non affichée)...{C_RESET}")
+                r = _ssh(key, ssh_target,
+                         f"cd {ctx['work_dir']} && {envprefix} {runcmd}", timeout=1200)
+                print(f"     {C_DIM}{(r.stdout or r.stderr).strip()[-800:]}{C_RESET}")
+
+                print(f"  {C_CYAN}[5c] Récupération du travail (diff) en local...{C_RESET}")
+                r = _ssh(key, ssh_target,
+                         f"cd {ctx['work_dir']} && git add -A && git diff --cached", timeout=60)
+                patch_path = os.path.join(os.path.expanduser('~'), f"{ctx['name']}-changes.patch")
+                if (r.stdout or '').strip():
+                    try:
+                        with open(patch_path, 'w', encoding='utf-8') as pf:
+                            pf.write(r.stdout)
+                        print(f"  {C_GREEN}✔ Travail de l'agent récupéré : {patch_path}{C_RESET}")
+                    except Exception as e:
+                        print(f"  {C_RED}Impossible d'écrire le diff : {e}{C_RESET}")
+                else:
+                    print(f"  {C_YELLOW}(Aucune modification produite par l'agent.){C_RESET}")
+            input(f"\n  {C_CYAN}👉 Entrée pour DÉTRUIRE la VM...{C_RESET}")
+        else:
+            print(f"\n  {C_GREEN}[5] VM prête. Connecte-toi pour travailler :{C_RESET}")
+            print(f'     {C_YELLOW}ssh -i "{key}" {ssh_target}{C_RESET}')
+            print(f"     {C_DIM}(repo cloné dans {ctx['work_dir']}){C_RESET}")
+            input(f"\n  {C_CYAN}👉 Entrée quand tu as terminé pour DÉTRUIRE la VM...{C_RESET}")
     except KeyboardInterrupt:
         print(f"\n  {C_YELLOW}Interruption — nettoyage en cours...{C_RESET}")
     except Exception as e:

@@ -72,11 +72,18 @@ Un mode pour faire travailler l'agent dans une **VM cloud jetable** : provisionn
 1. Génération d'une **clé SSH éphémère**.
 2. Création d'une VM **GCP `e2-micro`** (offre *Always Free*, zone `us-central1-a`).
 3. Récupération de l'IP, **`git clone`** du repo sur la VM.
-4. L'agent (ou vous, en SSH) travaille dans le repo.
+4. **Travail** dans le repo (voir *mode autonome* ci-dessous, ou vous-même en SSH).
 5. **Destruction** de la VM **et de ses disques** (`--delete-disks=all`) + suppression de la clé locale.
 
+### 🤖 Mode autonome (l'agent bosse seul dans la VM)
+Si vous répondez **oui** à « Mode autonome », l'agent s'occupe de tout dans la VM :
+- **5a.** installe le CLI-agent choisi sur la VM (`claude` par défaut : Node.js + `npm i -g @anthropic-ai/claude-code`) ;
+- **5b.** le lance en **headless** sur le repo avec votre tâche, la **clé API étant transmise par variable d'environnement** (jamais affichée ni journalisée) ;
+- **5c.** **rapatrie le diff en local** (`~/<nom-vm>-changes.patch`) avant destruction — vous gardez le travail même une fois la VM détruite.
+- Une VM **headless exige une clé API** (pas d'OAuth interactif) : définissez-la localement, ex. `setx ANTHROPIC_API_KEY <clé>`. Si elle manque, l'étape agent est sautée proprement.
+
 - **DRY-RUN par défaut** : `[V]` affiche l'intégralité des commandes qui *seraient* exécutées (avec coût estimé ~0,01 $/2 h et notes de sécurité) **sans rien créer**. Il faut taper `EXECUTER` puis confirmer pour lancer réellement.
-- **Prérequis pour l'exécution réelle** : le **Google Cloud SDK** (`gcloud`) installé et authentifié (`gcloud auth login`).
+- **Prérequis pour l'exécution réelle** : le **Google Cloud SDK** (`gcloud`) installé et authentifié (`gcloud auth login`) ; en mode autonome, la clé API de l'agent en variable d'environnement.
 - **Sécurité** : clé SSH jetable, **destruction garantie** de la VM même en cas d'erreur (bloc `finally`) — jamais de VM facturée oubliée. Pour un repo privé, utilisez un token Git à portée limitée que vous révoquez ensuite.
 
 > ⚠️ L'exécution réelle est **expérimentale** (non vérifiée contre un vrai projet GCP). Validez d'abord le plan en dry-run.
