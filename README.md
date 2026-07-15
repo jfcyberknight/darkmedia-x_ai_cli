@@ -29,6 +29,10 @@ Ainsi le cerveau ne « cède » jamais la main à une session interactive : il g
 
 > ⚠️ **Note** : les CLIs délégués (Claude, agy, Vibe…) utilisent leurs propres identifiants/API. Assurez-vous qu'ils sont configurés pour que l'agent puisse les piloter.
 
+- **Résilience à l'authentification** : si un CLI délégué renvoie une erreur d'auth (session/OAuth expirée, clé API manquante…), l'agent le **détecte** et te **propose de te reconnecter tout de suite** (`Te reconnecter à … maintenant ? [O/n]`) :
+  - **Oui** → il lance la connexion du CLI (`claude auth login`, `opencode auth login`, `vibe --setup`…), puis **réessaie l'étape** automatiquement.
+  - **Non** → il **écarte ce CLI** pour la session et **bascule** vers un autre CLI disponible.
+
 ## 🎚️ Choix du modèle par CLI (option `[M]`)
 
 Chaque CLI peut tourner avec le **modèle de votre choix**, et par défaut avec **le modèle le moins cher** :

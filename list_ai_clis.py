@@ -832,6 +832,63 @@ def run_tool(tool, prompt=None):
     print(f"\n{C_GREEN}✓ Retour au tableau de bord de {tool['name']}.{C_RESET}")
     time.sleep(1.2)
 
+# Comment se reconnecter à chaque CLI (affiché en cas d'échec d'authentification).
+AUTH_HINTS = {
+    'claude':   "lance `claude` puis tape `/login`",
+    'agy':      "lance `agy` et reconnecte ton compte Google",
+    'opencode': "lance `opencode auth login` (ou `opencode providers`)",
+    'kilocode': "lance `kilocode auth` pour reconnecter le fournisseur",
+    'kilo':     "lance `kilo auth` pour reconnecter le fournisseur",
+    'vibe':     "lance `vibe --setup` pour reconfigurer la clé API",
+    'mistral':  "lance `mistral --setup` pour reconfigurer la clé API",
+}
+
+_AUTH_PATTERNS = (
+    'failed to authenticate', 'oauth', 'session expired', 'token expired',
+    'expired token', 'not authenticated', 'unauthorized', '401',
+    'authentication failed', 'authentication required', 'auth required',
+    'invalid api key', 'no api key', 'api key not', 'missing api key',
+    'please log in', 'please login', 'not logged in', 'login required',
+    'log in to', 'sign in to', 'no credentials', 'invalid credentials',
+)
+
+def is_auth_error(text):
+    """Vrai si la sortie d'un CLI ressemble à un échec d'authentification."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(p in low for p in _AUTH_PATTERNS)
+
+# Commande de connexion (interactive) par CLI : args ajoutés après l'exécutable.
+# [] = lancer le CLI tel quel en interactif (cas où il n'a pas de sous-commande login).
+AUTH_COMMANDS = {
+    'claude':   ['auth', 'login'],
+    'opencode': ['auth', 'login'],
+    'kilocode': ['auth', 'login'],
+    'kilo':     ['auth', 'login'],
+    'vibe':     ['--setup'],
+    'mistral':  ['--setup'],
+    'agy':      [],
+}
+
+def run_cli_interactive(tool, extra_args):
+    """Lance un CLI en mode INTERACTIF (stdin/stdout hérités) pour que
+    l'utilisateur puisse se connecter (OAuth/navigateur, clé API…)."""
+    path = tool['path']
+    try:
+        if path.lower().endswith(('.cmd', '.bat')):
+            cmdline = ' '.join(_quote_arg(a) for a in [path] + list(extra_args))
+            subprocess.run(cmdline, shell=True)
+        elif path.lower().endswith('.ps1'):
+            subprocess.run(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                            '-File', path] + list(extra_args))
+        else:
+            subprocess.run([path] + list(extra_args))
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"  {C_RED}Erreur pendant la connexion : {e}{C_RESET}")
+
 AGENT_MAX_STEPS = 5  # garde-fou : nombre maxi d'appels CLI par demande
 
 def ask_agent(scanned):
@@ -868,17 +925,24 @@ def ask_agent(scanned):
 
     history = []          # [{cli, prompt, output}]
     final_message = None
+    unavailable = set()   # CLIs écartés pour la session (ex. non authentifiés)
 
     for step in range(1, AGENT_MAX_STEPS + 1):
+        # CLIs encore utilisables (on retire ceux dont l'auth a échoué).
+        available = [t for t in installed if t['command'] not in unavailable]
+        if not available:
+            print(f"\n  {C_RED}⚠ Plus aucun CLI authentifié n'est disponible pour continuer.{C_RESET}")
+            break
+
         # 1) Décider de la prochaine action.
         decision = None
         if ok:
             print(f"\n  {C_DIM}⏳ Le cerveau réfléchit à la prochaine étape...{C_RESET}")
-            decision = brain_next_action(query, installed, history, model)
+            decision = brain_next_action(query, available, history, model)
         if decision is None:
             # Repli : sans cerveau, on route une seule fois par mots-clés.
             if not history:
-                r = route_with_keywords(query, installed)
+                r = route_with_keywords(query, available)
                 if r:
                     decision = {'action': 'call', 'tool': r['tool'], 'prompt': query}
             if decision is None:
@@ -924,6 +988,50 @@ def ask_agent(scanned):
         out = res['output'] or "(aucune sortie)"
         tag = f"{C_GREEN}OK{C_RESET}" if res['ok'] else f"{C_RED}échec (code {res['code']}){C_RESET}"
         print(f"\n  {C_CYAN}━━ Fin de l'étape {step} [{tag}{C_CYAN}] ━━{C_RESET}")
+
+        # Échec d'authentification : proposer de se reconnecter tout de suite,
+        # sinon écarter ce CLI et laisser le cerveau basculer vers un autre.
+        if not res['ok'] and is_auth_error(out):
+            hint = AUTH_HINTS.get(tool['command'], "reconnecte-toi à cet outil")
+            print(f"\n  {C_RED}🔑 {tool['name']} n'est pas authentifié.{C_RESET} "
+                  f"{C_YELLOW}(→ {hint}){C_RESET}")
+            try:
+                do_auth = input(f"  {C_CYAN}👉 Te reconnecter à {tool['name']} maintenant ? "
+                                f"[{C_BOLD}O{C_RESET}{C_CYAN}/n] : {C_RESET}").strip().lower()
+            except KeyboardInterrupt:
+                do_auth = 'n'
+
+            if do_auth not in ('n', 'non', 'no'):
+                auth_args = AUTH_COMMANDS.get(tool['command'], [])
+                shown = (tool['command'] + ' ' + ' '.join(auth_args)).strip()
+                print(f"\n  {C_CYAN}⚙ Ouverture de la connexion : {shown}{C_RESET}")
+                if not auth_args:
+                    print(f"  {C_DIM}Connecte-toi, puis quitte l'outil (Ctrl+C) pour revenir.{C_RESET}")
+                print(f"  {C_DIM}(suis les instructions — navigateur/clé API — puis reviens ici){C_RESET}\n")
+                run_cli_interactive(tool, auth_args)
+
+                # Réessayer la même étape une fois la connexion faite.
+                print(f"\n  {C_DIM}↻ Reconnexion terminée — je réessaie l'étape {step}...{C_RESET}")
+                res = run_cli_headless(tool, sub, timeout=300, with_actions=True, stream=True)
+                out = res['output'] or "(aucune sortie)"
+                tag = f"{C_GREEN}OK{C_RESET}" if res['ok'] else f"{C_RED}échec (code {res['code']}){C_RESET}"
+                print(f"\n  {C_CYAN}━━ Réessai étape {step} [{tag}{C_CYAN}] ━━{C_RESET}")
+                if res['ok'] or not is_auth_error(out):
+                    history.append({'cli': tool['command'], 'prompt': sub, 'output': out})
+                    if not ok:
+                        break
+                    continue
+                print(f"  {C_YELLOW}Toujours pas authentifié — je passe à un autre CLI.{C_RESET}")
+
+            # Reconnexion refusée ou toujours en échec : écarter ce CLI.
+            unavailable.add(tool['command'])
+            history.append({'cli': tool['command'], 'prompt': sub,
+                            'output': (f"ÉCHEC : {tool['name']} n'est pas authentifié "
+                                       f"(non utilisable pour cette session). Choisis un AUTRE outil.")})
+            if ok:
+                continue  # laisser le cerveau re-décider avec un autre CLI
+            break         # sans cerveau : on s'arrête
+
         history.append({'cli': tool['command'], 'prompt': sub, 'output': out})
 
         if not ok:  # pas de cerveau → une seule étape
