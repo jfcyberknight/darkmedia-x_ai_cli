@@ -60,6 +60,23 @@ Quand vous **n'avez pas épinglé** de modèle pour un CLI, l'agent choisit le *
 
 > 💡 Les modèles « éco » sont moins chers mais parfois moins performants. L'auto-sélection monte en `costaud` pour les tâches complexes ; sinon, épinglez le modèle voulu via `[M]`.
 
+## ☁️ Session VPS éphémère (option `[V]`)
+
+Un mode pour faire travailler l'agent dans une **VM cloud jetable** : provisionnement → clonage du repo → travail → **destruction complète**. Idéal pour ne rien laisser traîner sur votre machine ni dans le cloud.
+
+**Cycle de vie** (pour un dépôt Git donné) :
+1. Génération d'une **clé SSH éphémère**.
+2. Création d'une VM **GCP `e2-micro`** (offre *Always Free*, zone `us-central1-a`).
+3. Récupération de l'IP, **`git clone`** du repo sur la VM.
+4. L'agent (ou vous, en SSH) travaille dans le repo.
+5. **Destruction** de la VM **et de ses disques** (`--delete-disks=all`) + suppression de la clé locale.
+
+- **DRY-RUN par défaut** : `[V]` affiche l'intégralité des commandes qui *seraient* exécutées (avec coût estimé ~0,01 $/2 h et notes de sécurité) **sans rien créer**. Il faut taper `EXECUTER` puis confirmer pour lancer réellement.
+- **Prérequis pour l'exécution réelle** : le **Google Cloud SDK** (`gcloud`) installé et authentifié (`gcloud auth login`).
+- **Sécurité** : clé SSH jetable, **destruction garantie** de la VM même en cas d'erreur (bloc `finally`) — jamais de VM facturée oubliée. Pour un repo privé, utilisez un token Git à portée limitée que vous révoquez ensuite.
+
+> ⚠️ L'exécution réelle est **expérimentale** (non vérifiée contre un vrai projet GCP). Validez d'abord le plan en dry-run.
+
 ### Prérequis de l'agent (optionnels)
 Pour le routage intelligent, installez Ollama et au moins un modèle :
 ```bash

@@ -11,6 +11,7 @@ import json
 import re
 import queue
 import threading
+import tempfile
 import urllib.request
 import urllib.error
 
@@ -946,6 +947,205 @@ def ask_agent(scanned):
     except KeyboardInterrupt:
         pass
 
+# ============================================================================
+#  MODE VPS ÉPHÉMÈRE (cloud)
+#  Provisionne une VM GCP jetable, y clone un repo, laisse l'agent travailler,
+#  puis DÉTRUIT la VM (+ disques). DRY-RUN par défaut : rien n'est créé tant
+#  que l'utilisateur n'a pas explicitement validé. La destruction est garantie
+#  (bloc finally) pour ne jamais laisser une VM facturée en vie.
+# ============================================================================
+
+VPS_CONFIG = {
+    'zone': 'us-central1-a',            # zone éligible à l'offre gratuite
+    'machine_type': 'e2-micro',         # Always Free
+    'image_family': 'debian-12',
+    'image_project': 'debian-cloud',
+    'ssh_user': 'aiagent',
+    'name_prefix': 'ai-ephemeral',
+    'work_dir': '~/work',
+    'default_repo': 'https://github.com/jfcyberknight/apartment-repair-tracker.git',
+}
+
+def build_vps_plan(c):
+    """Construit le plan (label, note, commande affichable) du cycle de vie."""
+    pub = f'{c["key_path"]}.pub'
+    return [
+        ("1. Clé SSH éphémère",
+         "Paire de clés jetable, supprimée en fin de session.",
+         f'ssh-keygen -t ed25519 -f "{c["key_path"]}" -N "" -C "ai-ephemeral"'),
+        ("2. Création VM (e2-micro · Free Tier)",
+         f'Instance jetable dans {c["zone"]}.',
+         f'gcloud compute instances create {c["name"]} --zone={c["zone"]} '
+         f'--machine-type={c["machine_type"]} --image-family={c["image_family"]} '
+         f'--image-project={c["image_project"]} '
+         f'--metadata=ssh-keys="{c["ssh_user"]}:$(cat {pub})"'),
+        ("3. Récupération de l'IP externe",
+         "Lecture de l'IP publique une fois la VM prête.",
+         f'gcloud compute instances describe {c["name"]} --zone={c["zone"]} '
+         f'--format="get(networkInterfaces[0].accessConfigs[0].natIP)"'),
+        ("4. Clonage du dépôt sur la VM",
+         "Connexion SSH + git clone dans le dossier de travail.",
+         f'ssh -i "{c["key_path"]}" -o StrictHostKeyChecking=no {c["ssh_user"]}@<IP_VM> '
+         f'"git clone {c["repo"]} {c["work_dir"]}"'),
+        ("5. Travail de l'agent (personnalisable)",
+         "Emplacement où lancer ton CLI-agent sur la VM (à installer/choisir).",
+         f'ssh -i "{c["key_path"]}" {c["ssh_user"]}@<IP_VM> "cd {c["work_dir"]} && <ton agent>"'),
+        ("6. Destruction de la VM (nettoyage sécurisé)",
+         "Supprime l'instance ET ses disques : aucune trace ne subsiste.",
+         f'gcloud compute instances delete {c["name"]} --zone={c["zone"]} '
+         f'--delete-disks=all --quiet'),
+        ("7. Suppression de la clé SSH locale",
+         "Efface la clé éphémère de ta machine (fait en Python via os.remove).",
+         f'del "{c["key_path"]}" "{pub}"'),
+    ]
+
+def _vps_context(repo):
+    name = f'{VPS_CONFIG["name_prefix"]}-{time.strftime("%Y%m%d-%H%M%S")}'
+    key_path = os.path.join(tempfile.gettempdir(), name)
+    ctx = dict(VPS_CONFIG)
+    ctx.update({'name': name, 'repo': repo, 'key_path': key_path})
+    return ctx
+
+def print_vps_plan(ctx):
+    plan = build_vps_plan(ctx)
+    print(f"\n  {C_BOLD}Plan de session — VM « {ctx['name']} »{C_RESET}")
+    print(f"  {C_DIM}Repo : {ctx['repo']}{C_RESET}\n")
+    for label, note, cmd in plan:
+        print(f"  {C_CYAN}{label}{C_RESET}")
+        print(f"     {C_DIM}{note}{C_RESET}")
+        print(f"     {C_YELLOW}$ {cmd}{C_RESET}\n")
+    print(f"  {C_GREEN}💰 Coût estimé{C_RESET} : ~0,01 $ / 2 h sous l'offre gratuite "
+          f"(e2-micro Always Free ; seule l'IP externe est facturée).")
+    print(f"  {C_GREEN}🔒 Sécurité{C_RESET}   : clé SSH éphémère + destruction VM & disques ; "
+          f"pour un repo privé, utilise un token Git à portée limitée que tu révoques après.")
+
+def run_vps_session(scanned):
+    """Menu [V] : session VPS éphémère. DRY-RUN par défaut."""
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print(f"\n{C_BLUE}  ┌────────────────────────────────────────────────────────┐{C_RESET}")
+    print(f"{C_BLUE}  │        ☁  SESSION VPS ÉPHÉMÈRE (cloud, jetable)        │{C_RESET}")
+    print(f"{C_BLUE}  └────────────────────────────────────────────────────────┘{C_RESET}\n")
+    print(f"  {C_DIM}Crée une VM GCP jetable → clone le repo → l'agent bosse → détruit la VM.{C_RESET}")
+    print(f"  {C_YELLOW}Mode DRY-RUN : rien n'est créé tant que tu n'as pas validé.{C_RESET}\n")
+
+    try:
+        repo = input(f"  {C_CYAN}Dépôt Git à travailler [{VPS_CONFIG['default_repo']}] : {C_RESET}").strip()
+    except KeyboardInterrupt:
+        return
+    if not repo:
+        repo = VPS_CONFIG['default_repo']
+
+    ctx = _vps_context(repo)
+    print_vps_plan(ctx)
+
+    print(f"\n  {C_YELLOW}▲ DRY-RUN : aucune des commandes ci-dessus n'a été exécutée.{C_RESET}")
+    print(f"  {C_DIM}Pour lancer réellement (nécessite « gcloud » authentifié), tape "
+          f"EXECUTER en majuscules. Entrée = revenir.{C_RESET}")
+    try:
+        go = input(f"  {C_CYAN}👉 : {C_RESET}").strip()
+    except KeyboardInterrupt:
+        return
+    if go != 'EXECUTER':
+        return
+
+    gcloud = find_tool_path('gcloud')
+    if not gcloud:
+        print(f"\n  {C_RED}⚠ « gcloud » introuvable. Installe le Google Cloud SDK et fais "
+              f"« gcloud auth login » avant de réessayer.{C_RESET}")
+        time.sleep(3)
+        return
+    print(f"\n  {C_RED}⚠ EXÉCUTION RÉELLE (expérimentale, non vérifiée contre un vrai projet GCP).{C_RESET}")
+    print(f"  {C_DIM}La VM sera systématiquement détruite à la fin, même en cas d'erreur.{C_RESET}")
+    try:
+        confirm = input(f"  {C_CYAN}Confirmer la création réelle de la VM ? [o/N] : {C_RESET}").strip().lower()
+    except KeyboardInterrupt:
+        return
+    if confirm not in ('o', 'oui', 'y', 'yes'):
+        print(f"  {C_YELLOW}Annulé.{C_RESET}")
+        time.sleep(1)
+        return
+    _vps_execute_live(ctx, gcloud)
+    try:
+        input(f"\n  {C_DIM}Entrée pour revenir au tableau de bord...{C_RESET}")
+    except KeyboardInterrupt:
+        pass
+
+def _run(argv, **kw):
+    return subprocess.run(argv, capture_output=True, text=True,
+                          encoding='utf-8', errors='replace', **kw)
+
+def _vps_execute_live(ctx, gcloud):
+    """Exécute réellement le cycle de vie. Destruction garantie (finally)."""
+    key = ctx['key_path']
+    created = False
+    try:
+        # 1) Clé SSH éphémère
+        print(f"\n  {C_CYAN}[1/5] Génération de la clé SSH éphémère...{C_RESET}")
+        r = _run(['ssh-keygen', '-t', 'ed25519', '-f', key, '-N', '', '-C', 'ai-ephemeral'])
+        if r.returncode != 0:
+            print(f"  {C_RED}Échec ssh-keygen : {r.stderr.strip()}{C_RESET}")
+            return
+        with open(f'{key}.pub', 'r', encoding='utf-8') as f:
+            pub = f.read().strip()
+
+        # 2) Création de la VM
+        print(f"  {C_CYAN}[2/5] Création de la VM {ctx['name']} (peut prendre ~30 s)...{C_RESET}")
+        r = _run([gcloud, 'compute', 'instances', 'create', ctx['name'],
+                  f'--zone={ctx["zone"]}', f'--machine-type={ctx["machine_type"]}',
+                  f'--image-family={ctx["image_family"]}', f'--image-project={ctx["image_project"]}',
+                  f'--metadata=ssh-keys={ctx["ssh_user"]}:{pub}'])
+        if r.returncode != 0:
+            print(f"  {C_RED}Échec création VM : {r.stderr.strip()[:800]}{C_RESET}")
+            return
+        created = True
+
+        # 3) IP externe
+        print(f"  {C_CYAN}[3/5] Lecture de l'IP externe...{C_RESET}")
+        r = _run([gcloud, 'compute', 'instances', 'describe', ctx['name'], f'--zone={ctx["zone"]}',
+                  '--format=get(networkInterfaces[0].accessConfigs[0].natIP)'])
+        ip = (r.stdout or '').strip()
+        if not ip:
+            print(f"  {C_RED}IP introuvable : {r.stderr.strip()[:400]}{C_RESET}")
+            return
+        print(f"     {C_GREEN}IP : {ip}{C_RESET}")
+
+        # 4) Clonage du dépôt (petite attente que SSH soit prêt)
+        print(f"  {C_CYAN}[4/5] Clonage du dépôt sur la VM (attente du démarrage SSH)...{C_RESET}")
+        time.sleep(20)
+        ssh_target = f'{ctx["ssh_user"]}@{ip}'
+        r = _run(['ssh', '-i', key, '-o', 'StrictHostKeyChecking=no',
+                  '-o', 'UserKnownHostsFile=/dev/null', ssh_target,
+                  f'git clone {ctx["repo"]} {ctx["work_dir"]}'])
+        print(f"     {C_DIM}{(r.stdout or r.stderr).strip()[:600]}{C_RESET}")
+
+        # 5) Main à l'utilisateur pour travailler dans la VM
+        print(f"\n  {C_GREEN}[5/5] VM prête. Connecte-toi pour travailler :{C_RESET}")
+        print(f'     {C_YELLOW}ssh -i "{key}" {ssh_target}{C_RESET}')
+        print(f"     {C_DIM}(repo cloné dans {ctx['work_dir']}){C_RESET}")
+        input(f"\n  {C_CYAN}👉 Appuie sur Entrée quand tu as terminé pour DÉTRUIRE la VM...{C_RESET}")
+    except KeyboardInterrupt:
+        print(f"\n  {C_YELLOW}Interruption — nettoyage en cours...{C_RESET}")
+    except Exception as e:
+        print(f"\n  {C_RED}Erreur : {e} — nettoyage en cours...{C_RESET}")
+    finally:
+        # Destruction garantie de la VM + de la clé locale.
+        if created:
+            print(f"\n  {C_CYAN}Destruction de la VM {ctx['name']}...{C_RESET}")
+            r = _run([gcloud, 'compute', 'instances', 'delete', ctx['name'],
+                      f'--zone={ctx["zone"]}', '--delete-disks=all', '--quiet'])
+            if r.returncode == 0:
+                print(f"  {C_GREEN}✔ VM détruite (instance + disques).{C_RESET}")
+            else:
+                print(f"  {C_RED}⚠ Échec destruction — vérifie manuellement : "
+                      f"gcloud compute instances delete {ctx['name']} --zone={ctx['zone']}{C_RESET}")
+        for f in (key, f'{key}.pub'):
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
+        print(f"  {C_DIM}Clé SSH éphémère supprimée.{C_RESET}")
+
 def main():
     # Définir le titre de la console Windows
     if sys.platform == 'win32':
@@ -965,12 +1165,13 @@ def main():
         
         print(f"  {C_MAGENTA}{C_BOLD}[A]{C_RESET} 🧠 Demander à l'agent IA (langage naturel — choix auto du CLI)")
         print(f"  {C_BOLD}[M]{C_RESET} ⚙  Choisir le modèle par CLI")
+        print(f"  {C_BLUE}{C_BOLD}[V]{C_RESET} ☁  Session VPS éphémère (cloud jetable — dry-run)")
         print(f"  {C_BOLD}[R]{C_RESET} Actualiser la liste")
         print(f"  {C_BOLD}[Q]{C_RESET} Quitter le tableau de bord")
         print()
 
         try:
-            choice = input(f"  {C_CYAN}👉 Votre choix (N°, A, M, R ou Q) : {C_RESET}").strip().lower()
+            choice = input(f"  {C_CYAN}👉 Votre choix (N°, A, M, V, R ou Q) : {C_RESET}").strip().lower()
         except KeyboardInterrupt:
             print(f"\n\n{C_GREEN}Au revoir !{C_RESET}")
             time.sleep(0.8)
@@ -985,6 +1186,9 @@ def main():
             continue
         elif choice == 'm':
             configure_models(scanned)
+            continue
+        elif choice == 'v':
+            run_vps_session(scanned)
             continue
         elif choice == 'r':
             print("\nActualisation...")
